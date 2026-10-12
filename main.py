@@ -37,8 +37,24 @@ def init_db():
         );
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
-    cur.execute("ALTER TABLE users DROP COLUMN IF EXISTS email;")
     
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallets (
+            user_id VARCHAR(50) PRIMARY KEY,
+            fiat_balance NUMERIC DEFAULT 0
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS portfolios (
+            user_id VARCHAR(50),
+            asset_symbol VARCHAR(10),
+            quantity NUMERIC,
+            average_buy_price NUMERIC,
+            PRIMARY KEY (user_id, asset_symbol)
+        );
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
@@ -51,7 +67,6 @@ def init_db():
         );
     """)
 
-    # Limit Orders Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
@@ -64,13 +79,22 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+
+    # NEW: Master Equity Tracking Table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS equity_history (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(50),
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            equity NUMERIC
+        );
+    """)
     conn.commit()
     cur.close()
     conn.close()
 
 init_db()
 
-# --- BACKGROUND MATCHING ENGINE ---
 async def order_book_matching_worker():
     symbols = ['AAPL', 'TSLA', 'NVDA', 'BTC', 'ETH', 'SOL']
     while True:
@@ -119,6 +143,11 @@ class UserAuth(BaseModel):
     user_id: str
     password: str
 
+# NEW: Data model for frontend equity snapshots
+class EquitySnapshot(BaseModel):
+    user_id: str
+    equity: float
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
@@ -127,8 +156,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Session expired.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token.")
-
-# ----------------- AUTHENTICATION -----------------
 
 @app.post("/api/auth/register")
 def register_user(user: UserAuth):
@@ -163,8 +190,6 @@ def login_user(user: UserAuth):
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = jwt.encode({"sub": user.user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": token, "token_type": "bearer"}
-
-# ----------------- ACCOUNT & MARKET DATA -----------------
 
 @app.get("/api/wallet/{user_id}")
 def get_wallet_balance(user_id: str, token_user: str = Depends(verify_token)):
@@ -218,7 +243,39 @@ def get_transactions(user_id: str, token_user: str = Depends(verify_token)):
     conn.close()
     return {"user_id": user_id, "transactions": txs}
 
-# ----------------- TRADE EXECUTION & LIMIT ORDERS -----------------
+# NEW: Master Equity Snapshot Engine
+@app.post("/api/equity/record")
+def record_equity(snapshot: EquitySnapshot, token_user: str = Depends(verify_token)):
+    if token_user != snapshot.user_id:
+        raise HTTPException(status_code=403, detail="IDOR attempt blocked.")
+    
+    conn = psycopg2.connect(DB_URL)
+    cur = conn.cursor()
+    
+    # Throttle: Only insert a new snapshot if the last one was over 5 minutes ago to avoid spamming the DB
+    cur.execute("SELECT id FROM equity_history WHERE user_id = %s AND timestamp > NOW() - INTERVAL '5 minutes';", (snapshot.user_id,))
+    if not cur.fetchone():
+        cur.execute("INSERT INTO equity_history (user_id, equity) VALUES (%s, %s);", (snapshot.user_id, snapshot.equity))
+        conn.commit()
+        
+    cur.execute("SELECT EXTRACT(EPOCH FROM timestamp), equity FROM equity_history WHERE user_id = %s ORDER BY timestamp ASC;", (snapshot.user_id,))
+    rows = cur.fetchall()
+    
+    # Seed Data: If this is a new account, inject a flat line of $10,000 for the last 7 days so the chart renders nicely
+    if len(rows) < 2:
+        base_time = datetime.now() - timedelta(days=7)
+        cur.execute("INSERT INTO equity_history (user_id, timestamp, equity) VALUES (%s, %s, %s);", (snapshot.user_id, base_time, 10000.00))
+        cur.execute("INSERT INTO equity_history (user_id, timestamp, equity) VALUES (%s, %s, %s);", (snapshot.user_id, datetime.now(), snapshot.equity))
+        conn.commit()
+        cur.execute("SELECT EXTRACT(EPOCH FROM timestamp), equity FROM equity_history WHERE user_id = %s ORDER BY timestamp ASC;", (snapshot.user_id,))
+        rows = cur.fetchall()
+
+    # Format perfectly for Lightweight Charts AreaSeries
+    history = [{"time": int(r[0]), "value": float(r[1])} for r in rows]
+    
+    cur.close()
+    conn.close()
+    return {"history": history}
 
 @app.post("/api/trade/buy")
 def buy_asset(trade: TradeRequest, token_user: str = Depends(verify_token)):
@@ -265,17 +322,7 @@ def get_active_orders(user_id: str, token_user: str = Depends(verify_token)):
         WHERE user_id = %s AND status = 'PENDING' 
         ORDER BY created_at DESC;
     """, (user_id,))
-    active_orders = [
-        {
-            "id": r[0],
-            "symbol": r[1],
-            "side": r[2],
-            "quantity": float(r[3]),
-            "target_price": float(r[4]),
-            "created_at": r[5]
-        }
-        for r in cur.fetchall()
-    ]
+    active_orders = [{"id": r[0], "symbol": r[1], "side": r[2], "quantity": float(r[3]), "target_price": float(r[4]), "created_at": r[5]} for r in cur.fetchall()]
     cur.close()
     conn.close()
     return {"user_id": user_id, "orders": active_orders}
